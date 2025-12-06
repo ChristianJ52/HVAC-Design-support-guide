@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
-from math import pi, log, exp, sqrt
+from math import pi, log, log10, exp, sqrt
 
 # ============================================================================
 # CONFIGURATION & CONSTANTS
@@ -99,6 +99,43 @@ class PsychrometricCalculator:
         Psat_T = PsychrometricCalculator.saturation_pressure(T)
         Psat_Tdew = PsychrometricCalculator.saturation_pressure(Tdew)
         return 100 * (Psat_Tdew / Psat_T)
+    
+    @staticmethod
+    def pmv_ppd(ta, tr, vel, rh, met=1.2, clo=0.5, wme=0):
+        """
+        Predicted Mean Vote (PMV) and PPD per ISO 7730 (Fanger).
+        Returns tuple (pmv, ppd).
+        """
+        pa = rh * 10 * exp(16.6536 - 4030.183 / (ta + 235))  # water vapor partial pressure Pa
+        icl = 0.155 * clo  # clothing insulation m2K/W
+        m = met * 58.15  # metabolic rate W/m2
+        w = wme * 58.15
+        mw = m - w
+        if icl <= 0:
+            f_cl = 1.0
+        else:
+            f_cl = 1.0 + 0.31 * icl
+        hcf = 12.1 * sqrt(vel)
+        taa = ta + 273
+        tra = tr + 273
+        t_cl = (35.5 - 0.028 * mw) - icl * ((mw / 3.96) - 0.1 - pa)
+        for _ in range(150):
+            hcn = 2.38 * abs(100.0 * f_cl * (t_cl - ta)) ** 0.25
+            hc = max(hcf, hcn)
+            t_cl_old = t_cl
+            t_cl = ((35.5 - 0.028 * mw) - (icl * (mw - 3.05 * (5.733 - 0.007 * mw - pa) - 0.42 * (mw - 58.15) - 0.0173 * m * (5.867 - pa) - 0.0014 * m * (34 - ta)))) / (1 + 0.155 * icl * f_cl * hc)
+            if abs(t_cl - t_cl_old) < 0.001:
+                break
+        # heat loss terms
+        hl1 = 3.05 * max(0, 5733 - 6.99 * mw - pa) / 1000
+        hl2 = 0.42 * (mw - 58.15) / 1000
+        hl3 = 1.7e-5 * m * (5867 - pa)
+        hl4 = 0.0014 * m * (34 - ta)
+        hl5 = 3.96e-8 * f_cl * ((t_cl + 273) ** 4 - (tra) ** 4)
+        hl6 = f_cl * hc * (t_cl - ta)
+        pmv = (0.303 * exp(-0.036 * m) + 0.028) * (mw - hl1 - hl2 - hl3 - hl4 - hl5 - hl6)
+        ppd = 100 - 95 * exp(-0.03353 * pmv ** 4 - 0.2179 * pmv ** 2)
+        return pmv, ppd
 
 # ============================================================================
 # VENTILATION CALCULATIONS
@@ -231,6 +268,64 @@ class DuctCalculator:
         return flow_rate_m3s / area_m2
     
     @staticmethod
+    def hydraulic_diameter_rect(width_mm, height_mm):
+        """Hydraulic diameter for rectangular ducts (m) per CIBSE/ASHRAE"""
+        a = width_mm / 1000
+        b = height_mm / 1000
+        if (a + b) == 0:
+            return None
+        return (2 * a * b) / (a + b)
+    
+    @staticmethod
+    def equivalent_circular_diameter(width_mm, height_mm):
+        """
+        Huebscher equivalent circular diameter (mm) for rectangular ducts.
+        Reference: CIBSE/ASHRAE, Huebscher correlation.
+        """
+        a = width_mm / 1000
+        b = height_mm / 1000
+        if (a + b) == 0:
+            return None
+        d_e = (1.30 * (a * b) ** 0.625) / ((a + b) ** 0.25)
+        return d_e * 1000
+    
+    @staticmethod
+    def friction_factor_swamee_jain(reynolds, diameter_m, roughness_m=9e-5):
+        """
+        Swamee-Jain explicit approximation of Colebrook-White.
+        Reference: ASHRAE/standard hydraulics. Valid for turbulent Re > ~4000.
+        """
+        if reynolds <= 0 or diameter_m <= 0:
+            return None
+        if reynolds < 2300:
+            return 64 / reynolds  # laminar
+        term = (roughness_m / (3.7 * diameter_m)) + (5.74 / (reynolds ** 0.9))
+        try:
+            return 0.25 / (log10(term) ** 2)
+        except (ValueError, ZeroDivisionError):
+            return None
+    
+    @staticmethod
+    def pressure_drop_darcy(flow_rate_ls, hydraulic_diameter_m, area_m2, density=1.2, viscosity=1.81e-5, roughness_m=9e-5):
+        """
+        Darcy-Weisbach pressure drop (Pa/m) using Swamee-Jain friction factor.
+        Returns tuple: (pressure_drop_per_m, friction_factor, reynolds, velocity).
+        Reference: Darcy-Weisbach, Swamee-Jain (ASHRAE Fundamentals).
+        """
+        if hydraulic_diameter_m is None or hydraulic_diameter_m <= 0 or area_m2 <= 0:
+            return None, None, None, None
+        flow_m3s = flow_rate_ls / 1000
+        velocity = flow_m3s / area_m2
+        if velocity <= 0 or viscosity <= 0:
+            return None, None, None, None
+        reynolds = (density * velocity * hydraulic_diameter_m) / viscosity
+        f = DuctCalculator.friction_factor_swamee_jain(reynolds, hydraulic_diameter_m, roughness_m)
+        if f is None:
+            return None, None, reynolds, velocity
+        dp_per_m = f * (density * velocity ** 2) / (2 * hydraulic_diameter_m)
+        return dp_per_m, f, reynolds, velocity
+    
+    @staticmethod
     def interpret_velocity(velocity, application="commercial"):
         """Interpret if velocity is appropriate"""
         limits = {
@@ -250,10 +345,56 @@ class DuctCalculator:
             return "✓ Acceptable", "Velocity within recommended range"
 
 # ============================================================================
+# REPORT BUILDER
+# ============================================================================
+
+def generate_report(data):
+    """
+    Build a plain-text report of key HVAC calculations (CIBSE/ASHRAE/ISO refs).
+    """
+    lines = []
+    lines.append("HVAC Decision Support System Report")
+    lines.append("-----------------------------------")
+    lines.append("Ventilation & IAQ")
+    lines.append(f"  Method: {data.get('vent_method', 'N/A')}")
+    lines.append(f"  Flow: {data.get('vent_flow_ls', 'N/A')} l/s | ACH: {data.get('vent_ach', 'N/A')} h-1")
+    lines.append(f"  CO2 Target: {data.get('vent_co2_target', 'N/A')} ppm")
+    if data.get("vent_insights"):
+        for ins in data["vent_insights"]:
+            lines.append(f"    - {ins}")
+    lines.append("")
+    lines.append("Fan Power & SFP")
+    lines.append(f"  Flow: {data.get('fan_flow_ls', 'N/A')} l/s | SFP: {data.get('sfp', 'N/A')} W/(l/s)")
+    lines.append(f"  Fan Power: {data.get('fan_power_w', 'N/A')} W")
+    lines.append("")
+    lines.append("Duct Sizing")
+    lines.append(f"  Shape: {data.get('duct_shape', 'N/A')} | Main: {data.get('duct_main_size_mm', 'N/A')} mm | Branch: {data.get('duct_branch_size_mm', 'N/A')} mm")
+    lines.append(f"  Velocities: main {data.get('duct_velocity_main', 'N/A')} m/s, branch {data.get('duct_velocity_branch', 'N/A')} m/s")
+    lines.append(f"  Pressure Drop: {data.get('duct_pressure_drop_pa_per_m', 'N/A')} Pa/m | f={data.get('duct_friction_factor', 'N/A')} | Re={data.get('duct_reynolds', 'N/A')}")
+    lines.append(f"  Diffusers: {data.get('duct_diffuser_count', 'N/A')}")
+    lines.append("")
+    lines.append("Psychrometrics")
+    lines.append(f"  Dry Bulb: {data.get('psychro_dry_bulb', 'N/A')} °C | RH: {data.get('psychro_rh', 'N/A')} %")
+    lines.append(f"  Enthalpy: {data.get('psychro_enthalpy', 'N/A')} kJ/kg | Moisture: {data.get('psychro_moisture', 'N/A')} g/kg | Dew Point: {data.get('psychro_dew_point', 'N/A')} °C")
+    lines.append(f"  PMV: {data.get('pmv', 'N/A')} | PPD: {data.get('ppd', 'N/A')} %")
+    lines.append(f"  Heating Load: {data.get('heating_power_kw', 'N/A')} kW | Cooling Load: {data.get('cooling_power_kw', 'N/A')} kW")
+    lines.append("")
+    lines.append("Fan Laws Projection")
+    lines.append(f"  New RPM: {data.get('fan_law_rpm_target', 'N/A')} | Flow: {data.get('fan_law_flow', 'N/A')} l/s | Pressure: {data.get('fan_law_pressure', 'N/A')} Pa | Power: {data.get('fan_law_power', 'N/A')} W")
+    lines.append("")
+    lines.append("Notes: Values are indicative. Verify against project-specific standards (CIBSE Guide A/B, ASHRAE, ISO 7730).")
+    return "\n".join(str(x) for x in lines)
+
+# ============================================================================
 # STREAMLIT APPLICATION
 # ============================================================================
 
 def main():
+    # Initialize shared report data
+    if "report_data" not in st.session_state:
+        st.session_state["report_data"] = {}
+    report_data = st.session_state["report_data"]
+    report_data.clear()
     # Page configuration
     st.set_page_config(
         page_title="HVAC Decision Support System",
@@ -340,13 +481,17 @@ def main():
         - CIBSE Guide B (Heating Systems)
         - Part L Building Regulations
         """)
+        
+        st.markdown("---")
+        generate_now = st.button("📄 Generate Report")
     
     # Main content - Tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🌬️ Air Change Rates & IAQ",
         "⚡ SFP & Fan Power",
         "📏 Duct Sizing",
-        "🌡️ Psychrometrics"
+        "🌡️ Psychrometrics",
+        "⚙️ Fan Laws"
     ])
     
     # ========================================================================
@@ -453,6 +598,16 @@ def main():
             # Display results
             st.metric("Total Fresh Air Required", f"{total_flow_rate:.1f} l/s")
             st.metric("Air Changes per Hour (ACH)", f"{ach:.2f} h⁻¹")
+            report_data.update({
+                "vent_flow_ls": total_flow_rate,
+                "vent_ach": ach,
+                "vent_method": sizing_method,
+                "vent_space_type": space_type,
+                "vent_co2_target": target_co2,
+                "vent_flow_occ": flow_occ,
+                "vent_flow_area": flow_area,
+                "vent_flow_ach": flow_ach,
+            })
             
             # Comparison table of methods
             comparison_rows = []
@@ -562,6 +717,11 @@ def main():
         
         for insight in insights:
             st.markdown(f'<div class="insight-box">{insight}</div>', unsafe_allow_html=True)
+        
+        # Store for report
+        report_data.update({
+            "vent_insights": insights
+        })
     
     # ========================================================================
     # TAB 2: SFP & FAN POWER
@@ -626,6 +786,11 @@ def main():
             
             # Display SFP
             st.metric("Specific Fan Power (SFP)", f"{sfp:.3f} W/(l/s)")
+            report_data.update({
+                "sfp": sfp,
+                "fan_power_w": fan_power_input,
+                "fan_flow_ls": flow_rate_fan
+            })
             
             # Interpretation
             status, message = FanCalculator.interpret_sfp(sfp)
@@ -727,6 +892,12 @@ def main():
         with col1:
             st.subheader("Input Parameters")
             
+            duct_shape = st.radio(
+                "Duct Shape",
+                ["Circular", "Rectangular"],
+                horizontal=True
+            )
+            
             duct_flow_rate = st.number_input(
                 "Air Flow Rate (l/s)",
                 value=250.0,
@@ -755,26 +926,49 @@ def main():
                 help=f"Recommended maximum for {application_type.lower()}: {max_velocity_recommended} m/s"
             )
             
-            # Calculate required diameter
-            required_diameter = DuctCalculator.calculate_diameter(duct_flow_rate, target_velocity)
-            nearest_standard = DuctCalculator.find_nearest_standard_size(required_diameter)
-            actual_velocity = DuctCalculator.actual_velocity(duct_flow_rate, nearest_standard)
+            if duct_shape == "Circular":
+                # Calculate required diameter
+                required_diameter = DuctCalculator.calculate_diameter(duct_flow_rate, target_velocity)
+                nearest_standard = DuctCalculator.find_nearest_standard_size(required_diameter)
+                actual_velocity = DuctCalculator.actual_velocity(duct_flow_rate, nearest_standard)
+                area_m2 = pi * (nearest_standard / 2000) ** 2
+                hydraulic_diameter_m = nearest_standard / 1000
+                eq_circ = nearest_standard
+                width_mm = height_mm = None
+            else:
+                width_mm = st.number_input("Rectangular Width (mm)", value=500.0, min_value=100.0, step=25.0)
+                height_mm = st.number_input("Rectangular Height (mm)", value=300.0, min_value=100.0, step=25.0)
+                area_m2 = (width_mm / 1000) * (height_mm / 1000)
+                hydraulic_diameter_m = DuctCalculator.hydraulic_diameter_rect(width_mm, height_mm)
+                eq_circ = DuctCalculator.equivalent_circular_diameter(width_mm, height_mm)
+                actual_velocity = (duct_flow_rate / 1000) / area_m2 if area_m2 else 0.0
+                required_diameter = eq_circ
+                nearest_standard = DuctCalculator.find_nearest_standard_size(eq_circ) if eq_circ else None
             
             st.markdown("---")
             st.subheader("Results")
             
             col1a, col1b = st.columns(2)
             with col1a:
-                st.metric("Required Diameter", f"{required_diameter:.1f} mm")
+                if duct_shape == "Circular":
+                    st.metric("Required Diameter", f"{required_diameter:.1f} mm")
+                else:
+                    st.metric("Equivalent Circular", f"{eq_circ:.1f} mm")
             with col1b:
-                st.metric("Standard Size", f"{nearest_standard} mm")
+                if nearest_standard:
+                    st.metric("Nearest Circular Size", f"{nearest_standard} mm")
+                else:
+                    st.metric("Nearest Circular Size", "N/A")
             
             col1c, col1d = st.columns(2)
             with col1c:
                 st.metric("Actual Velocity", f"{actual_velocity:.2f} m/s")
             with col1d:
-                size_difference = ((nearest_standard - required_diameter) / required_diameter) * 100
-                st.metric("Size Adjustment", f"{size_difference:+.1f}%")
+                if duct_shape == "Circular" and nearest_standard:
+                    size_difference = ((nearest_standard - required_diameter) / required_diameter) * 100
+                    st.metric("Size Adjustment", f"{size_difference:+.1f}%")
+                else:
+                    st.metric("Size Adjustment", "—")
             
             # Velocity interpretation
             vel_status, vel_message = DuctCalculator.interpret_velocity(actual_velocity, application_type.lower())
@@ -785,73 +979,94 @@ def main():
             else:
                 st.markdown(f'<div class="insight-box"><strong>{vel_status}:</strong> {vel_message}</div>', 
                            unsafe_allow_html=True)
+            
+            # Pressure drop using Darcy-Weisbach + Swamee-Jain
+            dp_per_m, f_factor, reynolds, vel_used = DuctCalculator.pressure_drop_darcy(
+                duct_flow_rate,
+                hydraulic_diameter_m,
+                area_m2,
+                density=air_density
+            )
+            
+            col_pd1, col_pd2 = st.columns(2)
+            with col_pd1:
+                st.metric("Pressure Drop", f"{dp_per_m:.2f} Pa/m" if dp_per_m is not None else "N/A")
+            with col_pd2:
+                st.metric("Friction Factor", f"{f_factor:.4f}" if f_factor is not None else "N/A")
+            st.caption("Swamee-Jain friction factor with Darcy-Weisbach pressure drop.")
         
         with col2:
             st.subheader("Standard Duct Sizes Reference")
             
-            # Create comparison table
-            comparison_data = []
-            for size in EngineeringConstants.STANDARD_DUCT_SIZES:
-                vel = DuctCalculator.actual_velocity(duct_flow_rate, size)
-                area = pi * (size / 2000) ** 2
-                comparison_data.append({
-                    "Diameter (mm)": size,
-                    "Velocity (m/s)": f"{vel:.2f}",
-                    "Area (m²)": f"{area:.4f}"
-                })
-            
-            df = pd.DataFrame(comparison_data)
-            
-            # Highlight the selected size
-            def highlight_row(row):
-                if row["Diameter (mm)"] == nearest_standard:
-                    return ['background-color: lightgreen'] * len(row)
-                return [''] * len(row)
-            
-            st.dataframe(
-                df.style.apply(highlight_row, axis=1),
-                height=400,
-                use_container_width=True
-            )
-            
-            st.caption("✅ Highlighted row shows the recommended standard size for your application")
+            if duct_shape == "Circular":
+                # Create comparison table
+                comparison_data = []
+                for size in EngineeringConstants.STANDARD_DUCT_SIZES:
+                    vel = DuctCalculator.actual_velocity(duct_flow_rate, size)
+                    area = pi * (size / 2000) ** 2
+                    comparison_data.append({
+                        "Diameter (mm)": size,
+                        "Velocity (m/s)": f"{vel:.2f}",
+                        "Area (m²)": f"{area:.4f}"
+                    })
+                
+                df = pd.DataFrame(comparison_data)
+                
+                # Highlight the selected size
+                def highlight_row(row):
+                    if row["Diameter (mm)"] == nearest_standard:
+                        return ['background-color: lightgreen'] * len(row)
+                    return [''] * len(row)
+                
+                st.dataframe(
+                    df.style.apply(highlight_row, axis=1),
+                    height=400,
+                    use_container_width=True
+                )
+                
+                st.caption("✅ Highlighted row shows the recommended standard size for your application")
+            else:
+                st.info("Standard circular size table is hidden for rectangular selection.")
         
         # Velocity Chart
         st.markdown("---")
         st.subheader("Velocity Analysis Across Standard Sizes")
         
-        fig, ax = plt.subplots(figsize=(12, 5))
-        
-        sizes_array = np.array(EngineeringConstants.STANDARD_DUCT_SIZES)
-        velocities = [DuctCalculator.actual_velocity(duct_flow_rate, s) for s in sizes_array]
-        
-        # Plot bars
-        colors = ['red' if v > max_velocity_recommended or v < EngineeringConstants.DUCT_VELOCITY_MIN 
-                 else 'orange' if v > max_velocity_recommended * 0.8 
-                 else 'green' for v in velocities]
-        
-        bars = ax.bar(range(len(sizes_array)), velocities, color=colors, alpha=0.7, edgecolor='black')
-        
-        # Highlight selected size
-        selected_idx = list(sizes_array).index(nearest_standard)
-        bars[selected_idx].set_edgecolor('darkblue')
-        bars[selected_idx].set_linewidth(3)
-        
-        # Reference lines
-        ax.axhline(y=max_velocity_recommended, color='red', linestyle='--', 
-                  linewidth=2, label=f'Max Velocity ({max_velocity_recommended} m/s)', alpha=0.7)
-        ax.axhline(y=EngineeringConstants.DUCT_VELOCITY_MIN, color='blue', 
-                  linestyle='--', linewidth=2, label=f'Min Velocity ({EngineeringConstants.DUCT_VELOCITY_MIN} m/s)', alpha=0.7)
-        
-        ax.set_xlabel('Duct Size (mm)', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Velocity (m/s)', fontsize=12, fontweight='bold')
-        ax.set_title('Air Velocity for Different Standard Duct Sizes', fontsize=14, fontweight='bold')
-        ax.set_xticks(range(len(sizes_array)))
-        ax.set_xticklabels(sizes_array, rotation=45, ha='right')
-        ax.legend(loc='best')
-        ax.grid(True, axis='y', alpha=0.3)
-        
-        st.pyplot(fig)
+        if duct_shape == "Circular":
+            fig, ax = plt.subplots(figsize=(12, 5))
+            
+            sizes_array = np.array(EngineeringConstants.STANDARD_DUCT_SIZES)
+            velocities = [DuctCalculator.actual_velocity(duct_flow_rate, s) for s in sizes_array]
+            
+            # Plot bars
+            colors = ['red' if v > max_velocity_recommended or v < EngineeringConstants.DUCT_VELOCITY_MIN 
+                     else 'orange' if v > max_velocity_recommended * 0.8 
+                     else 'green' for v in velocities]
+            
+            bars = ax.bar(range(len(sizes_array)), velocities, color=colors, alpha=0.7, edgecolor='black')
+            
+            # Highlight selected size
+            selected_idx = list(sizes_array).index(nearest_standard)
+            bars[selected_idx].set_edgecolor('darkblue')
+            bars[selected_idx].set_linewidth(3)
+            
+            # Reference lines
+            ax.axhline(y=max_velocity_recommended, color='red', linestyle='--', 
+                      linewidth=2, label=f'Max Velocity ({max_velocity_recommended} m/s)', alpha=0.7)
+            ax.axhline(y=EngineeringConstants.DUCT_VELOCITY_MIN, color='blue', 
+                      linestyle='--', linewidth=2, label=f'Min Velocity ({EngineeringConstants.DUCT_VELOCITY_MIN} m/s)', alpha=0.7)
+            
+            ax.set_xlabel('Duct Size (mm)', fontsize=12, fontweight='bold')
+            ax.set_ylabel('Velocity (m/s)', fontsize=12, fontweight='bold')
+            ax.set_title('Air Velocity for Different Standard Duct Sizes', fontsize=14, fontweight='bold')
+            ax.set_xticks(range(len(sizes_array)))
+            ax.set_xticklabels(sizes_array, rotation=45, ha='right')
+            ax.legend(loc='best')
+            ax.grid(True, axis='y', alpha=0.3)
+            
+            st.pyplot(fig)
+        else:
+            st.info("Velocity bar chart is available for circular duct selections.")
         
         # Engineering Insights
         st.markdown("---")
@@ -860,11 +1075,14 @@ def main():
         insights_duct = []
         
         if actual_velocity > max_velocity_recommended:
-            next_size_up = EngineeringConstants.STANDARD_DUCT_SIZES[
-                EngineeringConstants.STANDARD_DUCT_SIZES.index(nearest_standard) + 1
-            ]
-            vel_next_size = DuctCalculator.actual_velocity(duct_flow_rate, next_size_up)
-            insights_duct.append(f"❌ **Velocity Too High:** Current velocity {actual_velocity:.2f} m/s exceeds {max_velocity_recommended} m/s limit. Use {next_size_up} mm duct (velocity: {vel_next_size:.2f} m/s) for quieter operation.")
+            if duct_shape == "Circular" and nearest_standard and nearest_standard != EngineeringConstants.STANDARD_DUCT_SIZES[-1]:
+                next_size_up = EngineeringConstants.STANDARD_DUCT_SIZES[
+                    EngineeringConstants.STANDARD_DUCT_SIZES.index(nearest_standard) + 1
+                ]
+                vel_next_size = DuctCalculator.actual_velocity(duct_flow_rate, next_size_up)
+                insights_duct.append(f"❌ **Velocity Too High:** Current velocity {actual_velocity:.2f} m/s exceeds {max_velocity_recommended} m/s limit. Use {next_size_up} mm duct (velocity: {vel_next_size:.2f} m/s) for quieter operation.")
+            else:
+                insights_duct.append(f"❌ **Velocity Too High:** Current velocity {actual_velocity:.2f} m/s exceeds {max_velocity_recommended} m/s limit. Increase duct size or reduce flow per branch.")
         
         if actual_velocity < EngineeringConstants.DUCT_VELOCITY_MIN:
             insights_duct.append(f"⚠️ **Velocity Too Low:** Risk of dust settlement and poor mixing. Consider reducing duct size or using rectangular ducts with better aspect ratios.")
@@ -873,18 +1091,15 @@ def main():
         if actual_velocity > 8:
             insights_duct.append("🔊 **Noise Warning:** High velocity may cause excessive noise. Consider acoustic lining or silencers.")
         
-        # Pressure drop estimate (Darcy-Weisbach approximation)
-        friction_factor = 0.02  # Typical for commercial ducts
-        diameter_m = nearest_standard / 1000
-        velocity_ms = actual_velocity
-        pressure_drop_per_m = friction_factor * (air_density * velocity_ms ** 2) / (2 * diameter_m)
-        
-        insights_duct.append(f"📊 **Pressure Drop Estimate:** ~{pressure_drop_per_m:.2f} Pa/m. For a 50m run, total ≈ {pressure_drop_per_m * 50:.0f} Pa.")
+        # Pressure drop estimate (Darcy-Weisbach)
+        if dp_per_m is not None:
+            insights_duct.append(f"📊 **Pressure Drop:** ~{dp_per_m:.2f} Pa/m (Re={reynolds:.0f}). For 50 m run: ≈ {dp_per_m * 50:.0f} Pa.")
         
         # Area utilization
-        area_utilization = (required_diameter / nearest_standard) ** 2
-        if area_utilization < 0.7:
-            insights_duct.append(f"⚡ **Over-sized:** Selected duct uses only {area_utilization*100:.0f}% of available area. This is acceptable for low noise but may increase costs.")
+        if duct_shape == "Circular" and nearest_standard and required_diameter:
+            area_utilization = (required_diameter / nearest_standard) ** 2
+            if area_utilization < 0.7:
+                insights_duct.append(f"⚡ **Over-sized:** Selected duct uses only {area_utilization*100:.0f}% of available area. This is acceptable for low noise but may increase costs.")
         
         if not insights_duct:
             insights_duct.append("✅ **Optimal Design:** Duct size provides appropriate velocity and meets all design constraints.")
@@ -973,6 +1188,19 @@ def main():
         with col_layout2:
             st.metric("Diffuser Count", diffuser_count)
             st.metric("Flow per Diffuser", f"{branch_flow:.1f} l/s")
+        
+        report_data.update({
+            "duct_shape": duct_shape,
+            "duct_flow_ls": duct_flow_rate,
+            "duct_main_size_mm": main_diameter if duct_shape == "Circular" else eq_circ,
+            "duct_branch_size_mm": branch_diameter,
+            "duct_velocity_main": main_velocity,
+            "duct_velocity_branch": branch_velocity,
+            "duct_pressure_drop_pa_per_m": dp_per_m,
+            "duct_friction_factor": f_factor,
+            "duct_reynolds": reynolds,
+            "duct_diffuser_count": diffuser_count
+        })
     
     # ========================================================================
     # TAB 4: PSYCHROMETRICS
@@ -1012,6 +1240,13 @@ def main():
             dew_point = calc.dew_point(dry_bulb, relative_humidity)
             enthalpy = calc.enthalpy(dry_bulb, relative_humidity, P_atm)
             vapor_pressure = calc.vapor_pressure(dry_bulb, relative_humidity)
+            report_data.update({
+                "psychro_dry_bulb": dry_bulb,
+                "psychro_rh": relative_humidity,
+                "psychro_enthalpy": enthalpy,
+                "psychro_dew_point": dew_point,
+                "psychro_moisture": moisture_content
+            })
             
             st.subheader("Calculated Properties")
             
@@ -1055,6 +1290,25 @@ def main():
                 
                 st.markdown(f'<div class="warning-box">⚠️ <strong>Outside Comfort Zone:</strong> {", ".join(issues)}</div>', 
                            unsafe_allow_html=True)
+            
+            st.markdown("---")
+            st.subheader("Thermal Comfort (PMV/PPD)")
+            mrt = st.number_input("Mean Radiant Temperature (°C)", value=dry_bulb, min_value=-20.0, max_value=50.0, step=0.5, key="mrt")
+            air_velocity = st.slider("Air Velocity (m/s)", min_value=0.0, max_value=1.5, value=0.1, step=0.05, key="air_vel")
+            met_rate = st.number_input("Metabolic Rate (met)", value=1.2, min_value=0.8, max_value=3.0, step=0.1, key="met_rate")
+            clothing = st.number_input("Clothing Level (clo)", value=0.7, min_value=0.0, max_value=2.0, step=0.1, key="clo_level")
+            pmv, ppd = PsychrometricCalculator.pmv_ppd(dry_bulb, mrt, air_velocity, relative_humidity, met=met_rate, clo=clothing)
+            col_pmv1, col_pmv2 = st.columns(2)
+            with col_pmv1:
+                st.metric("PMV", f"{pmv:.2f}")
+            with col_pmv2:
+                st.metric("PPD (%)", f"{ppd:.1f}%")
+            report_data.update({
+                "pmv": pmv,
+                "ppd": ppd,
+                "mrt": mrt,
+                "air_velocity": air_velocity
+            })
         
         with col2:
             st.subheader("Psychrometric Chart (Simplified)")
@@ -1081,6 +1335,17 @@ def main():
             # Plot current condition
             ax.plot(dry_bulb, moisture_content, 'ro', markersize=12, 
                    label=f'Current State\n{dry_bulb}°C, {relative_humidity}% RH', zorder=5)
+            
+            # Process line (cooling)
+            target_temp_line = st.session_state.get("cooling_temp", 15.0)
+            target_rh_line = st.session_state.get("cooling_rh", 50)
+            moisture_target_line = calc.moisture_content(target_temp_line, target_rh_line, P_atm)
+            ax.plot(
+                [dry_bulb, target_temp_line],
+                [moisture_content, moisture_target_line],
+                color='red', linestyle='-.', linewidth=2, label='Cooling Process'
+            )
+            ax.scatter(target_temp_line, moisture_target_line, color='purple', zorder=6, label='Cooled State')
             
             # Comfort zone
             comfort_temps = [comfort_temp_min, comfort_temp_max, comfort_temp_max, comfort_temp_min, comfort_temp_min]
@@ -1132,6 +1397,7 @@ def main():
                 mass_flow = (total_flow_rate / 1000) * air_density
                 heating_power = mass_flow * heating_energy
                 st.metric("Heating Load (from Tab 1 flow)", f"{heating_power:.2f} kW")
+                report_data.update({"heating_power_kw": heating_power})
 
         with col4:
             st.markdown("**Cooling & Dehumidification**")
@@ -1165,6 +1431,10 @@ def main():
                 condensate_rate = mass_flow * moisture_removed / 1000  # kg/s to l/h conversion
                 st.metric("Cooling Load (from Tab 1 flow)", f"{cooling_power:.2f} kW")
                 st.metric("Condensate Rate", f"{condensate_rate * 3.6:.2f} l/h")
+                report_data.update({
+                    "cooling_power_kw": cooling_power,
+                    "condensate_rate_lph": condensate_rate * 3.6
+                })
         
         # Engineering Insights
         st.markdown("---")
@@ -1227,6 +1497,61 @@ def main():
         
         df_ref = pd.DataFrame(ref_data)
         st.dataframe(df_ref, use_container_width=True, height=300)
+    
+    # ========================================================================
+    # TAB 5: FAN LAWS
+    # ========================================================================
+    with tab5:
+        st.header("Fan Laws")
+        st.markdown("*Predict performance changes with speed adjustments (ASHRAE fan laws)*")
+        
+        col_fl1, col_fl2 = st.columns(2)
+        with col_fl1:
+            flow_current = st.number_input("Current Flow (l/s)", value=500.0, min_value=0.0, step=10.0, key="fan_flow")
+            pressure_current = st.number_input("Current Pressure (Pa)", value=500.0, min_value=0.0, step=10.0, key="fan_pressure")
+            power_current = st.number_input("Current Power (W)", value=600.0, min_value=0.0, step=10.0, key="fan_power")
+            rpm_current = st.number_input("Current RPM", value=1200.0, min_value=1.0, step=50.0, key="fan_rpm")
+        
+        with col_fl2:
+            rpm_new_direct = st.number_input("New RPM", value=1400.0, min_value=1.0, step=50.0, key="fan_new_rpm")
+            speed_change_pct = st.slider("Speed Change (%)", min_value=-50, max_value=100, value=16, step=1,
+                                         help="Positive increases speed, negative reduces speed",
+                                         key="fan_speed_change")
+            rpm_new = rpm_current * (1 + speed_change_pct / 100)
+            rpm_target = rpm_new_direct if rpm_new_direct else rpm_new
+            st.caption(f"Computed RPM from percent change: {rpm_new:.0f} rpm")
+        
+        ratio = rpm_target / rpm_current if rpm_current else 0
+        new_flow = flow_current * ratio
+        new_pressure = pressure_current * ratio ** 2
+        new_power = power_current * ratio ** 3
+        
+        col_fl3, col_fl4, col_fl5 = st.columns(3)
+        with col_fl3:
+            st.metric("New Flow (l/s)", f"{new_flow:.1f}")
+        with col_fl4:
+            st.metric("New Pressure (Pa)", f"{new_pressure:.1f}")
+        with col_fl5:
+            st.metric("New Power (W)", f"{new_power:.1f}", help="Power changes with the cube of speed — watch energy use!")
+        
+        st.info("Fan Laws: Q₂/Q₁ = N₂/N₁, P₂/P₁ = (N₂/N₁)², Power₂/Power₁ = (N₂/N₁)³")
+        
+        report_data.update({
+            "fan_law_flow": new_flow,
+            "fan_law_pressure": new_pressure,
+            "fan_law_power": new_power,
+            "fan_law_rpm_target": rpm_target
+        })
+    
+    # Sidebar report download (after calculations)
+    report_text = generate_report(report_data)
+    if generate_now:
+        st.sidebar.download_button(
+            "⬇️ Download Report (.txt)",
+            data=report_text,
+            file_name="hvac_report.txt"
+        )
+        st.sidebar.success("Report generated. Download ready.")
     
     # Footer
     st.markdown("---")
