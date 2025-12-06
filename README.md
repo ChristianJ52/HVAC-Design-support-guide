@@ -41,3 +41,25 @@ The tool bridges the gap between theoretical standards (CIBSE/ASHRAE) and rapid 
 1. **Clone the repository:**
    ```bash
    git clone [https://github.com/yourusername/hvac-decision-support.git](https://github.com/yourusername/hvac-decision-support.git)
+⚡ How to Run This Program
+If you want to run this tool locally on your machine, follow these simple steps:
+
+1. Prerequisites Ensure you have Python installed (version 3.8 or higher).
+
+2. Clone the Repository Open your terminal/command prompt and run:
+
+Bash
+
+git clone https://github.com/yourusername/hvac-decision-support.git
+cd hvac-decision-support
+3. Install Dependencies Install the required Python libraries:
+
+Bash
+
+pip install streamlit numpy pandas matplotlib
+4. Launch the App Start the local server:
+
+Bash
+
+streamlit run hvac_tool.py
+The application will automatically open in your default web browser at http://localhost:8501.
